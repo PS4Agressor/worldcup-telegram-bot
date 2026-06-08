@@ -1,3 +1,6 @@
+Yes — paste this full bot.js exactly as-is. It keeps the free Render port fix, keeps the Telegram commands, and changes the fixture lookup so it pulls all not-started World Cup fixtures and filters them locally for the tracked team, which is more reliable than the earlier team + next shortcut. Render web services must bind to PORT, Telegram bots can use polling, and API-Football exposes fixture status values like upcoming matches through the fixtures endpoint.
+
+js
 import "dotenv/config";
 import axios from "axios";
 import Database from "better-sqlite3";
@@ -85,16 +88,34 @@ async function getWorldCupFixturesByDate(date) {
   return r.data?.response || [];
 }
 
-async function getNextFixtureForTeam(teamId) {
+async function getUpcomingWorldCupFixtures() {
   const r = await api.get("/fixtures", {
     params: {
       league: WORLD_CUP_LEAGUE_ID,
       season: WORLD_CUP_SEASON,
-      team: teamId,
-      next: 1,
+      status: "NS",
     },
   });
-  return r.data?.response?.[0] || null;
+  return r.data?.response || [];
+}
+
+async function getNextFixtureForTeam(teamId) {
+  const fixtures = await getUpcomingWorldCupFixtures();
+  const now = Date.now();
+
+  const upcoming = fixtures
+    .filter(
+      (fx) =>
+        (fx.teams.home.id === teamId || fx.teams.away.id === teamId) &&
+        new Date(fx.fixture.date).getTime() > now
+    )
+    .sort(
+      (a, b) =>
+        new Date(a.fixture.date).getTime() -
+        new Date(b.fixture.date).getTime()
+    );
+
+  return upcoming[0] || null;
 }
 
 const trackedTeams = (chatId) =>
@@ -102,8 +123,7 @@ const trackedTeams = (chatId) =>
     .prepare("SELECT * FROM tracked_teams WHERE chat_id = ? ORDER BY team_name")
     .all(String(chatId));
 
-const allTrackedTeams = () =>
-  db.prepare("SELECT * FROM tracked_teams").all();
+const allTrackedTeams = () => db.prepare("SELECT * FROM tracked_teams").all();
 
 const addTrackedTeam = (chatId, teamId, teamName) =>
   db
@@ -236,7 +256,9 @@ bot.command("matches", async (ctx) => {
     try {
       const fx = await getNextFixtureForTeam(team.team_id);
       if (fx) lines.push(`\n${team.team_name}:\n${matchLine(fx)}`);
-    } catch {}
+    } catch (e) {
+      console.error(`Failed to fetch next match for ${team.team_name}:`, e.message);
+    }
   }
 
   await ctx.reply(
@@ -275,7 +297,9 @@ async function pollMatches() {
   for (const date of dates) {
     try {
       fixtures = fixtures.concat(await getWorldCupFixturesByDate(date));
-    } catch {}
+    } catch (e) {
+      console.error(`Failed to fetch fixtures for ${date}:`, e.message);
+    }
   }
 
   const nowMs = Date.now();
