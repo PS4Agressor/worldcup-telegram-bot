@@ -1,6 +1,3 @@
-Yes — paste this full bot.js exactly as-is. It keeps the free Render port fix, keeps the Telegram commands, and changes the fixture lookup so it pulls all not-started World Cup fixtures and filters them locally for the tracked team, which is more reliable than the earlier team + next shortcut. Render web services must bind to PORT, Telegram bots can use polling, and API-Football exposes fixture status values like upcoming matches through the fixtures endpoint.
-
-js
 import "dotenv/config";
 import axios from "axios";
 import Database from "better-sqlite3";
