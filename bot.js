@@ -24,14 +24,14 @@ const db = new Database("worldcup-2026.sqlite");
 const PORT = Number(process.env.PORT || 10000);
 const HOST = "0.0.0.0";
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("World Cup Telegram bot is alive");
-});
-
-server.listen(PORT, HOST, () => {
-  console.log(`Health server listening on ${HOST}:${PORT}`);
-});
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("World Cup Telegram bot is alive");
+  })
+  .listen(PORT, HOST, () => {
+    console.log(`Health server listening on ${HOST}:${PORT}`);
+  });
 
 const api = axios.create({
   baseURL: "https://v3.football.api-sports.io",
@@ -42,9 +42,8 @@ const api = axios.create({
 db.exec(`
 CREATE TABLE IF NOT EXISTS tracked_teams (
   chat_id TEXT NOT NULL,
-  team_id INTEGER NOT NULL,
   team_name TEXT NOT NULL,
-  PRIMARY KEY (chat_id, team_id)
+  PRIMARY KEY (chat_id, team_name)
 );
 CREATE TABLE IF NOT EXISTS sent_events (
   chat_id TEXT NOT NULL,
@@ -54,36 +53,22 @@ CREATE TABLE IF NOT EXISTS sent_events (
 );
 `);
 
-const DEFAULT_TEAMS = [
-  "Argentina",
-  "Brazil",
-  "Portugal",
-  "France",
-  "England",
-  "Spain",
-  "Germany",
-  "Netherlands",
-  "Belgium",
-  "Croatia",
-  "Italy",
-  "Uruguay",
+const WORLD_CUP_TEAMS = [
+  "Mexico","South Korea","South Africa","Czechia",
+  "Canada","Switzerland","Qatar","Bosnia & Herzegovina",
+  "Brazil","Morocco","Scotland","Haiti",
+  "United States","Australia","Paraguay","Türkiye",
+  "Germany","Ecuador","Ivory Coast","Curaçao",
+  "Netherlands","Japan","Tunisia","Sweden",
+  "Belgium","Iran","Egypt","New Zealand",
+  "Spain","Uruguay","Saudi Arabia","Cape Verde",
+  "France","Senegal","Norway","Iraq",
+  "Argentina","Austria","Algeria","Jordan",
+  "Portugal","Colombia","Uzbekistan","Congo DR",
+  "England","Croatia","Panama","Ghana"
 ];
 
-async function searchTeam(name) {
-  const r = await api.get("/teams", { params: { search: name } });
-  return r.data?.response?.[0] || null;
-}
-
-async function getWorldCupFixturesByDate(date) {
-  const r = await api.get("/fixtures", {
-    params: {
-      league: WORLD_CUP_LEAGUE_ID,
-      season: WORLD_CUP_SEASON,
-      date,
-    },
-  });
-  return r.data?.response || [];
-}
+const PAGE_SIZE = 8;
 
 async function getUpcomingWorldCupFixtures() {
   const r = await api.get("/fixtures", {
@@ -96,43 +81,23 @@ async function getUpcomingWorldCupFixtures() {
   return r.data?.response || [];
 }
 
-async function getNextFixtureForTeam(teamId) {
-  const fixtures = await getUpcomingWorldCupFixtures();
-  const now = Date.now();
-
-  const upcoming = fixtures
-    .filter(
-      (fx) =>
-        (fx.teams.home.id === teamId || fx.teams.away.id === teamId) &&
-        new Date(fx.fixture.date).getTime() > now
-    )
-    .sort(
-      (a, b) =>
-        new Date(a.fixture.date).getTime() -
-        new Date(b.fixture.date).getTime()
-    );
-
-  return upcoming[0] || null;
-}
-
 const trackedTeams = (chatId) =>
   db
-    .prepare("SELECT * FROM tracked_teams WHERE chat_id = ? ORDER BY team_name")
+    .prepare("SELECT team_name FROM tracked_teams WHERE chat_id = ? ORDER BY team_name")
     .all(String(chatId));
 
-const allTrackedTeams = () => db.prepare("SELECT * FROM tracked_teams").all();
+const allTrackedTeams = () =>
+  db.prepare("SELECT chat_id, team_name FROM tracked_teams").all();
 
-const addTrackedTeam = (chatId, teamId, teamName) =>
+const addTrackedTeam = (chatId, teamName) =>
   db
-    .prepare(
-      "INSERT OR IGNORE INTO tracked_teams (chat_id, team_id, team_name) VALUES (?, ?, ?)"
-    )
-    .run(String(chatId), teamId, teamName);
+    .prepare("INSERT OR IGNORE INTO tracked_teams (chat_id, team_name) VALUES (?, ?)")
+    .run(String(chatId), teamName);
 
-const removeTrackedTeam = (chatId, teamId) =>
+const removeTrackedTeam = (chatId, teamName) =>
   db
-    .prepare("DELETE FROM tracked_teams WHERE chat_id = ? AND team_id = ?")
-    .run(String(chatId), teamId);
+    .prepare("DELETE FROM tracked_teams WHERE chat_id = ? AND team_name = ?")
+    .run(String(chatId), teamName);
 
 const isSent = (chatId, fixtureId, eventType) =>
   !!db
@@ -164,16 +129,52 @@ async function isAdmin(ctx) {
   }
 }
 
-function settingsKeyboard(chatId) {
+function settingsKeyboard(chatId, page = 0) {
   const current = trackedTeams(chatId).map((t) => t.team_name);
-  const rows = DEFAULT_TEAMS.map((name) => {
+  const start = page * PAGE_SIZE;
+  const teams = WORLD_CUP_TEAMS.slice(start, start + PAGE_SIZE);
+
+  const rows = teams.map((name) => {
     const enabled = current.includes(name);
     return [
-      Markup.button.callback(`${enabled ? "✅" : "➕"} ${name}`, `toggle:${name}`),
+      Markup.button.callback(
+        `${enabled ? "✅" : "➕"} ${name}`,
+        `toggle:${page}:${name}`
+      ),
     ];
   });
+
+  const nav = [];
+  if (page > 0) nav.push(Markup.button.callback("⬅️ Prev", `page:${page - 1}`));
+  if (start + PAGE_SIZE < WORLD_CUP_TEAMS.length) {
+    nav.push(Markup.button.callback("Next ➡️", `page:${page + 1}`));
+  }
+  if (nav.length) rows.push(nav);
+
   rows.push([Markup.button.callback("📋 My tracked teams", "list_teams")]);
+
   return Markup.inlineKeyboard(rows);
+}
+
+async function getNextFixtureForTeamName(teamName) {
+  const fixtures = await getUpcomingWorldCupFixtures();
+  const now = Date.now();
+
+  const upcoming = fixtures
+    .filter((fx) => {
+      const home = fx.teams.home.name?.toLowerCase();
+      const away = fx.teams.away.name?.toLowerCase();
+      const target = teamName.toLowerCase();
+      return (home === target || away === target) &&
+        new Date(fx.fixture.date).getTime() > now;
+    })
+    .sort(
+      (a, b) =>
+        new Date(a.fixture.date).getTime() -
+        new Date(b.fixture.date).getTime()
+    );
+
+  return upcoming[0] || null;
 }
 
 bot.start(async (ctx) =>
@@ -200,29 +201,40 @@ bot.command("settings", async (ctx) => {
   if (!(await isAdmin(ctx))) return ctx.reply("Only group admins can change settings.");
   await ctx.reply(
     "Select 2026 World Cup teams to track in this chat:",
-    settingsKeyboard(ctx.chat.id)
+    settingsKeyboard(ctx.chat.id, 0)
   );
 });
 
-bot.action(/^toggle:(.+)$/i, async (ctx) => {
+bot.action(/^page:(\d+)$/i, async (ctx) => {
+  if (!(await isAdmin(ctx))) return ctx.answerCbQuery("Admins only");
+  const page = Number(ctx.match[1] || 0);
+  await ctx.answerCbQuery();
+  await ctx.editMessageReplyMarkup(settingsKeyboard(ctx.chat.id, page).reply_markup);
+});
+
+bot.action(/^toggle:(\d+):(.+)$/i, async (ctx) => {
   if (!(await isAdmin(ctx))) return ctx.answerCbQuery("Admins only");
 
-  const name = ctx.match[1];
+  const page = Number(ctx.match[1] || 0);
+  const teamName = ctx.match[2];
+
+  if (!WORLD_CUP_TEAMS.includes(teamName)) {
+    return ctx.answerCbQuery("Team not found");
+  }
+
   const existing = trackedTeams(ctx.chat.id).find(
-    (t) => t.team_name.toLowerCase() === name.toLowerCase()
+    (t) => t.team_name.toLowerCase() === teamName.toLowerCase()
   );
 
   if (existing) {
-    removeTrackedTeam(ctx.chat.id, existing.team_id);
-    await ctx.answerCbQuery(`Removed ${name}`);
+    removeTrackedTeam(ctx.chat.id, teamName);
+    await ctx.answerCbQuery(`Removed ${teamName}`);
   } else {
-    const team = await searchTeam(name);
-    if (!team) return ctx.answerCbQuery("Team not found");
-    addTrackedTeam(ctx.chat.id, team.team.id, team.team.name);
-    await ctx.answerCbQuery(`Added ${team.team.name}`);
+    addTrackedTeam(ctx.chat.id, teamName);
+    await ctx.answerCbQuery(`Added ${teamName}`);
   }
 
-  await ctx.editMessageReplyMarkup(settingsKeyboard(ctx.chat.id).reply_markup);
+  await ctx.editMessageReplyMarkup(settingsKeyboard(ctx.chat.id, page).reply_markup);
 });
 
 bot.action("list_teams", async (ctx) => {
@@ -251,7 +263,7 @@ bot.command("matches", async (ctx) => {
   const lines = [];
   for (const team of teams) {
     try {
-      const fx = await getNextFixtureForTeam(team.team_id);
+      const fx = await getNextFixtureForTeamName(team.team_name);
       if (fx) lines.push(`\n${team.team_name}:\n${matchLine(fx)}`);
     } catch (e) {
       console.error(`Failed to fetch next match for ${team.team_name}:`, e.message);
@@ -277,44 +289,29 @@ async function pollMatches() {
   const tracked = allTrackedTeams();
   if (!tracked.length) return;
 
-  const grouped = new Map();
-  for (const row of tracked) {
-    if (!grouped.has(row.team_id)) grouped.set(row.team_id, []);
-    grouped.get(row.team_id).push(row);
-  }
-
-  const now = new Date();
-  const dates = [0, 1].map((offset) => {
-    const d = new Date(now);
-    d.setUTCDate(d.getUTCDate() + offset);
-    return d.toISOString().slice(0, 10);
-  });
-
-  let fixtures = [];
-  for (const date of dates) {
-    try {
-      fixtures = fixtures.concat(await getWorldCupFixturesByDate(date));
-    } catch (e) {
-      console.error(`Failed to fetch fixtures for ${date}:`, e.message);
-    }
-  }
-
+  const fixtures = await getUpcomingWorldCupFixtures().catch(() => []);
   const nowMs = Date.now();
 
-  for (const fx of fixtures) {
-    const related = [
-      ...(grouped.get(fx.teams.home.id) || []),
-      ...(grouped.get(fx.teams.away.id) || []),
-    ];
+  for (const row of tracked) {
+    const related = fixtures
+      .filter((fx) => {
+        const home = fx.teams.home.name?.toLowerCase();
+        const away = fx.teams.away.name?.toLowerCase();
+        const target = row.team_name.toLowerCase();
+        return home === target || away === target;
+      })
+      .sort(
+        (a, b) =>
+          new Date(a.fixture.date).getTime() -
+          new Date(b.fixture.date).getTime()
+      );
 
-    if (!related.length) continue;
+    for (const fx of related) {
+      const fixtureId = fx.fixture.id;
+      const kickoff = new Date(fx.fixture.date).getTime();
+      const started = nowMs >= kickoff && nowMs < kickoff + 10 * 60 * 1000;
+      const finished = ["FT", "AET", "PEN"].includes(fx.fixture.status.short);
 
-    const fixtureId = fx.fixture.id;
-    const kickoff = new Date(fx.fixture.date).getTime();
-    const started = nowMs >= kickoff && nowMs < kickoff + 10 * 60 * 1000;
-    const finished = ["FT", "AET", "PEN"].includes(fx.fixture.status.short);
-
-    for (const row of related) {
       if (started && !isSent(row.chat_id, fixtureId, "start")) {
         await bot.telegram.sendMessage(
           row.chat_id,
