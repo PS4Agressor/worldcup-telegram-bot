@@ -35,7 +35,7 @@ http
 
 const api = axios.create({
   baseURL: "https://v3.football.api-sports.io",
-  timeout: 15000,
+  timeout: 20000,
   headers: { "x-apisports-key": FOOTBALL_API_KEY },
 });
 
@@ -69,17 +69,6 @@ const WORLD_CUP_TEAMS = [
 ];
 
 const PAGE_SIZE = 8;
-
-async function getUpcomingWorldCupFixtures() {
-  const r = await api.get("/fixtures", {
-    params: {
-      league: WORLD_CUP_LEAGUE_ID,
-      season: WORLD_CUP_SEASON,
-      status: "NS",
-    },
-  });
-  return r.data?.response || [];
-}
 
 const trackedTeams = (chatId) =>
   db
@@ -156,15 +145,40 @@ function settingsKeyboard(chatId, page = 0) {
   return Markup.inlineKeyboard(rows);
 }
 
+async function getUpcomingWorldCupFixtures() {
+  let all = [];
+  let page = 1;
+  let totalPages = 1;
+
+  do {
+    const r = await api.get("/fixtures", {
+      params: {
+        league: WORLD_CUP_LEAGUE_ID,
+        season: WORLD_CUP_SEASON,
+        status: "NS",
+        page,
+      },
+    });
+
+    const fixtures = r.data?.response || [];
+    all = all.concat(fixtures);
+
+    totalPages = r.data?.paging?.total || 1;
+    page += 1;
+  } while (page <= totalPages);
+
+  return all;
+}
+
 async function getNextFixtureForTeamName(teamName) {
   const fixtures = await getUpcomingWorldCupFixtures();
   const now = Date.now();
+  const target = teamName.toLowerCase();
 
   const upcoming = fixtures
     .filter((fx) => {
       const home = fx.teams.home.name?.toLowerCase();
       const away = fx.teams.away.name?.toLowerCase();
-      const target = teamName.toLowerCase();
       return (home === target || away === target) &&
         new Date(fx.fixture.date).getTime() > now;
     })
@@ -264,7 +278,9 @@ bot.command("matches", async (ctx) => {
   for (const team of teams) {
     try {
       const fx = await getNextFixtureForTeamName(team.team_name);
-      if (fx) lines.push(`\n${team.team_name}:\n${matchLine(fx)}`);
+      if (fx) {
+        lines.push(`\n${team.team_name}:\n${matchLine(fx)}`);
+      }
     } catch (e) {
       console.error(`Failed to fetch next match for ${team.team_name}:`, e.message);
     }
@@ -289,7 +305,11 @@ async function pollMatches() {
   const tracked = allTrackedTeams();
   if (!tracked.length) return;
 
-  const fixtures = await getUpcomingWorldCupFixtures().catch(() => []);
+  const fixtures = await getUpcomingWorldCupFixtures().catch((e) => {
+    console.error("Fixture fetch failed:", e.message);
+    return [];
+  });
+
   const nowMs = Date.now();
 
   for (const row of tracked) {
