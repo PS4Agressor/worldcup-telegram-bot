@@ -68,6 +68,23 @@ const WORLD_CUP_TEAMS = [
   "England","Croatia","Panama","Ghana"
 ];
 
+const TEAM_ALIASES = {
+  "united states": ["usa", "u.s.a", "us", "united states", "united states of america"],
+  "south korea": ["korea republic", "korea", "south korea"],
+  "north korea": ["dpr korea", "north korea"],
+  "iran": ["ir iran", "iran"],
+  "cabo verde": ["cape verde", "cabo verde"],
+  "cape verde": ["cape verde", "cabo verde"],
+  "ivory coast": ["ivory coast", "cote d ivoire", "côte d'ivoire", "cote d'ivoire"],
+  "cote d ivoire": ["ivory coast", "cote d ivoire", "côte d'ivoire"],
+  "turkiye": ["turkiye", "turkey", "türkiye"],
+  "curaçao": ["curacao", "curaçao"],
+  "curacao": ["curacao", "curaçao"],
+  "congo dr": ["dr congo", "democratic republic of congo", "congo dr", "congo"],
+  "czechia": ["czechia", "czech republic"],
+  "bosnia & herzegovina": ["bosnia & herzegovina", "bosnia and herzegovina"],
+};
+
 const PAGE_SIZE = 8;
 
 const trackedTeams = (chatId) =>
@@ -90,23 +107,45 @@ const removeTrackedTeam = (chatId, teamName) =>
 
 const isSent = (chatId, fixtureId, eventType) =>
   !!db
-    .prepare(
-      "SELECT 1 FROM sent_events WHERE chat_id=? AND fixture_id=? AND event_type=?"
-    )
+    .prepare("SELECT 1 FROM sent_events WHERE chat_id=? AND fixture_id=? AND event_type=?")
     .get(String(chatId), fixtureId, eventType);
 
 const markSent = (chatId, fixtureId, eventType) =>
   db
-    .prepare(
-      "INSERT OR IGNORE INTO sent_events (chat_id, fixture_id, event_type) VALUES (?, ?, ?)"
-    )
+    .prepare("INSERT OR IGNORE INTO sent_events (chat_id, fixture_id, event_type) VALUES (?, ?, ?)")
     .run(String(chatId), fixtureId, eventType);
 
 const fmtDate = (date) =>
   new Date(date).toLocaleString("en-GB", { timeZone: TZ });
 
-const matchLine = (fx) =>
-  `${fx.teams.home.name} vs ${fx.teams.away.name}\n${fmtDate(fx.fixture.date)}`;
+function normalizeName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function nameVariants(name) {
+  const n = normalizeName(name);
+  const out = new Set([n]);
+  const alias = TEAM_ALIASES[n];
+  if (alias) for (const a of alias) out.add(normalizeName(a));
+  return [...out];
+}
+
+function teamMatches(a, b) {
+  const na = nameVariants(a);
+  const nb = nameVariants(b);
+  return na.some((x) => nb.includes(x));
+}
+
+function matchLine(fx) {
+  return `${fx.teams.home.name} vs ${fx.teams.away.name}\n${fmtDate(fx.fixture.date)}`;
+}
 
 async function isAdmin(ctx) {
   if (ADMIN_ONLY_SETTINGS !== "true" || ctx.chat.type === "private") return true;
@@ -160,9 +199,7 @@ async function getUpcomingWorldCupFixtures() {
       },
     });
 
-    const fixtures = r.data?.response || [];
-    all = all.concat(fixtures);
-
+    all = all.concat(r.data?.response || []);
     totalPages = r.data?.paging?.total || 1;
     page += 1;
   } while (page <= totalPages);
@@ -170,25 +207,44 @@ async function getUpcomingWorldCupFixtures() {
   return all;
 }
 
+function findFixtureForTeam(fixtures, teamName) {
+  const targetVariants = nameVariants(teamName);
+  const now = Date.now();
+
+  return fixtures
+    .filter((fx) => new Date(fx.fixture.date).getTime() > now)
+    .filter((fx) => {
+      const home = fx.teams.home.name || "";
+      const away = fx.teams.away.name || "";
+      const homeVariants = nameVariants(home);
+      const awayVariants = nameVariants(away);
+      return (
+        targetVariants.some((v) => homeVariants.includes(v)) ||
+        targetVariants.some((v) => awayVariants.includes(v)) ||
+        homeVariants.some((v) => targetVariants.includes(v)) ||
+        awayVariants.some((v) => targetVariants.includes(v))
+      );
+    })
+    .sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date))[0] || null;
+}
+
 async function getNextFixtureForTeamName(teamName) {
   const fixtures = await getUpcomingWorldCupFixtures();
-  const now = Date.now();
-  const target = teamName.toLowerCase();
+  let fx = findFixtureForTeam(fixtures, teamName);
+  if (fx) return fx;
 
-  const upcoming = fixtures
-    .filter((fx) => {
-      const home = fx.teams.home.name?.toLowerCase();
-      const away = fx.teams.away.name?.toLowerCase();
-      return (home === target || away === target) &&
-        new Date(fx.fixture.date).getTime() > now;
-    })
-    .sort(
-      (a, b) =>
-        new Date(a.fixture.date).getTime() -
-        new Date(b.fixture.date).getTime()
-    );
+  const fallback = await api.get("/fixtures", {
+    params: {
+      league: WORLD_CUP_LEAGUE_ID,
+      season: WORLD_CUP_SEASON,
+      team: undefined,
+      page: 1,
+    },
+  }).catch(() => null);
 
-  return upcoming[0] || null;
+  const more = fallback?.data?.response || [];
+  fx = findFixtureForTeam(more, teamName);
+  return fx;
 }
 
 bot.start(async (ctx) =>
@@ -274,16 +330,12 @@ bot.command("matches", async (ctx) => {
   const teams = trackedTeams(ctx.chat.id);
   if (!teams.length) return ctx.reply("No teams selected yet. Use /settings.");
 
+  const fixtures = await getUpcomingWorldCupFixtures().catch(() => []);
   const lines = [];
+
   for (const team of teams) {
-    try {
-      const fx = await getNextFixtureForTeamName(team.team_name);
-      if (fx) {
-        lines.push(`\n${team.team_name}:\n${matchLine(fx)}`);
-      }
-    } catch (e) {
-      console.error(`Failed to fetch next match for ${team.team_name}:`, e.message);
-    }
+    const fx = findFixtureForTeam(fixtures, team.team_name);
+    if (fx) lines.push(`\n${team.team_name}:\n${matchLine(fx)}`);
   }
 
   await ctx.reply(
@@ -315,16 +367,11 @@ async function pollMatches() {
   for (const row of tracked) {
     const related = fixtures
       .filter((fx) => {
-        const home = fx.teams.home.name?.toLowerCase();
-        const away = fx.teams.away.name?.toLowerCase();
-        const target = row.team_name.toLowerCase();
-        return home === target || away === target;
+        const home = fx.teams.home.name || "";
+        const away = fx.teams.away.name || "";
+        return teamMatches(home, row.team_name) || teamMatches(away, row.team_name);
       })
-      .sort(
-        (a, b) =>
-          new Date(a.fixture.date).getTime() -
-          new Date(b.fixture.date).getTime()
-      );
+      .sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date));
 
     for (const fx of related) {
       const fixtureId = fx.fixture.id;
