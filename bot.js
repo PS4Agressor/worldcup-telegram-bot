@@ -2,6 +2,7 @@ import "dotenv/config";
 import axios from "axios";
 import Database from "better-sqlite3";
 import cron from "node-cron";
+import http from "http";
 import { Telegraf, Markup } from "telegraf";
 
 const {
@@ -19,6 +20,18 @@ if (!BOT_TOKEN || !FOOTBALL_API_KEY) {
 
 const bot = new Telegraf(BOT_TOKEN);
 const db = new Database("worldcup-2026.sqlite");
+
+const PORT = Number(process.env.PORT || 10000);
+const HOST = "0.0.0.0";
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("World Cup Telegram bot is alive");
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`Health server listening on ${HOST}:${PORT}`);
+});
 
 const api = axios.create({
   baseURL: "https://v3.football.api-sports.io",
