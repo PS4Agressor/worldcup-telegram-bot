@@ -2,6 +2,7 @@ import "dotenv/config";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import http from "http";
+import axios from "axios";
 import { Telegraf, Markup } from "telegraf";
 
 const { BOT_TOKEN, TZ = "Europe/Riga", ADMIN_ONLY_SETTINGS = "true" } = process.env;
@@ -42,78 +43,25 @@ CREATE TABLE IF NOT EXISTS sent_events (
 
 const WORLD_CUP_TEAMS = ["France", "Portugal", "Norway"];
 
-// Times are stored in UTC and shown in Europe/Riga in messages.
 const FIXTURES = {
   france: [
-    {
-      key: "france-senegal-2026-06-16",
-      home: "France",
-      away: "Senegal",
-      date: "2026-06-16T19:00:00Z",
-      sourceNote: "Confirmed group game"
-    },
-    {
-      key: "france-iraq-2026-06-22",
-      home: "France",
-      away: "Iraq",
-      date: "2026-06-22T21:00:00Z",
-      sourceNote: "Confirmed group game"
-    },
-    {
-      key: "norway-france-2026-06-26",
-      home: "Norway",
-      away: "France",
-      date: "2026-06-26T19:00:00Z",
-      sourceNote: "Confirmed group game"
-    }
+    { key: "france-senegal-2026-06-16", home: "France", away: "Senegal", date: "2026-06-16T19:00:00Z" },
+    { key: "france-iraq-2026-06-22", home: "France", away: "Iraq", date: "2026-06-22T21:00:00Z" },
+    { key: "norway-france-2026-06-26", home: "Norway", away: "France", date: "2026-06-26T19:00:00Z" },
   ],
   portugal: [
-    {
-      key: "portugal-congo-dr-2026-06-17",
-      home: "Portugal",
-      away: "Congo DR",
-      date: "2026-06-17T17:00:00Z",
-      sourceNote: "Confirmed group game"
-    },
-    {
-      key: "portugal-uzbekistan-2026-06-23",
-      home: "Portugal",
-      away: "Uzbekistan",
-      date: "2026-06-23T17:00:00Z",
-      sourceNote: "Confirmed group game"
-    },
-    {
-      key: "colombia-portugal-2026-06-27",
-      home: "Colombia",
-      away: "Portugal",
-      date: "2026-06-27T23:30:00Z",
-      sourceNote: "Confirmed group game"
-    }
+    { key: "portugal-congo-dr-2026-06-17", home: "Portugal", away: "Congo DR", date: "2026-06-17T17:00:00Z" },
+    { key: "portugal-uzbekistan-2026-06-23", home: "Portugal", away: "Uzbekistan", date: "2026-06-23T17:00:00Z" },
+    { key: "colombia-portugal-2026-06-27", home: "Colombia", away: "Portugal", date: "2026-06-27T23:30:00Z" },
   ],
   norway: [
-    {
-      key: "iraq-norway-2026-06-16",
-      home: "Iraq",
-      away: "Norway",
-      date: "2026-06-16T21:00:00Z",
-      sourceNote: "Confirmed group game"
-    },
-    {
-      key: "norway-senegal-2026-06-22",
-      home: "Norway",
-      away: "Senegal",
-      date: "2026-06-22T23:00:00Z",
-      sourceNote: "Confirmed group game"
-    },
-    {
-      key: "norway-france-2026-06-26",
-      home: "Norway",
-      away: "France",
-      date: "2026-06-26T19:00:00Z",
-      sourceNote: "Confirmed group game"
-    }
-  ]
+    { key: "iraq-norway-2026-06-16", home: "Iraq", away: "Norway", date: "2026-06-16T21:00:00Z" },
+    { key: "norway-senegal-2026-06-22", home: "Norway", away: "Senegal", date: "2026-06-22T23:00:00Z" },
+    { key: "norway-france-2026-06-26", home: "Norway", away: "France", date: "2026-06-26T19:00:00Z" },
+  ],
 };
+
+const SCOREBOARD_URL = "https://www.espn.com/soccer/scoreboard/_/league/fifa.world";
 
 const trackedTeams = (chatId) =>
   db
@@ -135,16 +83,12 @@ const removeTrackedTeam = (chatId, teamName) =>
 
 const isSent = (chatId, fixtureKey, eventType) =>
   !!db
-    .prepare(
-      "SELECT 1 FROM sent_events WHERE chat_id = ? AND fixture_key = ? AND event_type = ?"
-    )
+    .prepare("SELECT 1 FROM sent_events WHERE chat_id = ? AND fixture_key = ? AND event_type = ?")
     .get(String(chatId), fixtureKey, eventType);
 
 const markSent = (chatId, fixtureKey, eventType) =>
   db
-    .prepare(
-      "INSERT OR IGNORE INTO sent_events (chat_id, fixture_key, event_type) VALUES (?, ?, ?)"
-    )
+    .prepare("INSERT OR IGNORE INTO sent_events (chat_id, fixture_key, event_type) VALUES (?, ?, ?)")
     .run(String(chatId), fixtureKey, eventType);
 
 function fmtDate(date) {
@@ -170,18 +114,6 @@ function getNextFixtureForTeam(teamName) {
       .filter((f) => new Date(f.date).getTime() > now)
       .sort((a, b) => new Date(a.date) - new Date(b.date))[0] || null
   );
-}
-
-function teamScheduleBlock(teamName) {
-  const fixtures = getFixturesForTeam(teamName)
-    .sort((a, b) => new Date(a.date) - new Date(b.date));
-
-  if (!fixtures.length) return null;
-
-  return [
-    `${teamName}:`,
-    ...fixtures.map((f) => `- ${f.home} vs ${f.away} — ${fmtDate(f.date)}`)
-  ].join("\n");
 }
 
 function teamNextBlock(teamName) {
@@ -212,6 +144,50 @@ async function isAdmin(ctx) {
   }
 }
 
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function fetchScoreFromEspn(home, away) {
+  try {
+    const response = await axios.get(SCOREBOARD_URL, {
+      timeout: 15000,
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
+
+    const html = response.data || "";
+    const homePattern = escapeRegex(home);
+    const awayPattern = escapeRegex(away);
+
+    const bothTeamsNearby = new RegExp(
+      `${homePattern}[\\s\\S]{0,300}?(\\d+)[\\s\\S]{0,120}?${awayPattern}[\\s\\S]{0,300}?(\\d+)`,
+      "i"
+    );
+
+    const reverseNearby = new RegExp(
+      `${awayPattern}[\\s\\S]{0,300}?(\\d+)[\\s\\S]{0,120}?${homePattern}[\\s\\S]{0,300}?(\\d+)`,
+      "i"
+    );
+
+    const m1 = html.match(bothTeamsNearby);
+    if (m1) {
+      return { homeScore: m1[1], awayScore: m1[2] };
+    }
+
+    const m2 = html.match(reverseNearby);
+    if (m2) {
+      return { homeScore: m2[2], awayScore: m2[1] };
+    }
+
+    return null;
+  } catch (e) {
+    console.error("Score fetch failed:", e.message);
+    return null;
+  }
+}
+
 bot.start(async (ctx) => {
   await ctx.reply(
     "World Cup bot is ready. Use /settings to track France, Portugal, and Norway."
@@ -225,7 +201,6 @@ bot.help(async (ctx) => {
       "/settings - choose teams to track in this chat",
       "/list - show tracked teams",
       "/matches - show next match for tracked teams",
-      "/schedule - show all confirmed group matches for tracked teams",
       "/teststart - sample kickoff alert",
       "/testresult - sample final result alert",
       "/help - show help",
@@ -237,10 +212,7 @@ bot.command("settings", async (ctx) => {
   if (!(await isAdmin(ctx))) {
     return ctx.reply("Only group admins can change settings.");
   }
-  await ctx.reply(
-    "Select teams to track in this chat:",
-    settingsKeyboard(ctx.chat.id)
-  );
+  await ctx.reply("Select teams to track in this chat:", settingsKeyboard(ctx.chat.id));
 });
 
 bot.action(/^toggle:(.+)$/i, async (ctx) => {
@@ -302,27 +274,12 @@ bot.command("matches", async (ctx) => {
   );
 });
 
-bot.command("schedule", async (ctx) => {
-  const teams = trackedTeams(ctx.chat.id);
-  if (!teams.length) {
-    return ctx.reply("No teams selected yet. Use /settings.");
-  }
-
-  const blocks = teams.map((t) => teamScheduleBlock(t.team_name)).filter(Boolean);
-
-  await ctx.reply(
-    blocks.length
-      ? blocks.join("\n\n")
-      : "No confirmed group schedule found for selected teams."
-  );
-});
-
 bot.command("teststart", async (ctx) => {
   await ctx.reply("⚽ Match starting now\nFrance vs Senegal\n2026 FIFA World Cup");
 });
 
 bot.command("testresult", async (ctx) => {
-  await ctx.reply("🏁 Full time\nFrance vs Senegal\n2026 FIFA World Cup");
+  await ctx.reply("🏁 Full time\nFrance 2 - 1 Senegal\n2026 FIFA World Cup");
 });
 
 async function pollMatches() {
@@ -339,7 +296,7 @@ async function pollMatches() {
     for (const fx of fixtures) {
       const kickoff = new Date(fx.date).getTime();
       const started = now >= kickoff && now < kickoff + 10 * 60 * 1000;
-      const finished = now >= kickoff + 2 * 60 * 60 * 1000;
+      const finishedWindow = now >= kickoff + 105 * 60 * 1000;
 
       if (started && !isSent(row.chat_id, fx.key, "start")) {
         await bot.telegram.sendMessage(
@@ -349,12 +306,16 @@ async function pollMatches() {
         markSent(row.chat_id, fx.key, "start");
       }
 
-      if (finished && !isSent(row.chat_id, fx.key, "result")) {
-        await bot.telegram.sendMessage(
-          row.chat_id,
-          `🏁 Full time\n${fx.home} vs ${fx.away}\n2026 FIFA World Cup`
-        );
-        markSent(row.chat_id, fx.key, "result");
+      if (finishedWindow && !isSent(row.chat_id, fx.key, "result")) {
+        const score = await fetchScoreFromEspn(fx.home, fx.away);
+
+        if (score) {
+          await bot.telegram.sendMessage(
+            row.chat_id,
+            `🏁 Full time\n${fx.home} ${score.homeScore} - ${score.awayScore} ${fx.away}\n2026 FIFA World Cup`
+          );
+          markSent(row.chat_id, fx.key, "result");
+        }
       }
     }
   }
