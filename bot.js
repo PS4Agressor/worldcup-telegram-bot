@@ -1,21 +1,13 @@
 import "dotenv/config";
-import axios from "axios";
 import Database from "better-sqlite3";
 import cron from "node-cron";
 import http from "http";
 import { Telegraf, Markup } from "telegraf";
 
-const {
-  BOT_TOKEN,
-  FOOTBALL_API_KEY,
-  WORLD_CUP_LEAGUE_ID = "1",
-  WORLD_CUP_SEASON = "2026",
-  TZ = "Europe/Riga",
-  ADMIN_ONLY_SETTINGS = "true",
-} = process.env;
+const { BOT_TOKEN, TZ = "Europe/Riga", ADMIN_ONLY_SETTINGS = "true" } = process.env;
 
-if (!BOT_TOKEN || !FOOTBALL_API_KEY) {
-  throw new Error("Missing BOT_TOKEN or FOOTBALL_API_KEY");
+if (!BOT_TOKEN) {
+  throw new Error("Missing BOT_TOKEN");
 }
 
 const bot = new Telegraf(BOT_TOKEN);
@@ -33,59 +25,95 @@ http
     console.log(`Health server listening on ${HOST}:${PORT}`);
   });
 
-const api = axios.create({
-  baseURL: "https://v3.football.api-sports.io",
-  timeout: 20000,
-  headers: { "x-apisports-key": FOOTBALL_API_KEY },
-});
-
 db.exec(`
 CREATE TABLE IF NOT EXISTS tracked_teams (
   chat_id TEXT NOT NULL,
   team_name TEXT NOT NULL,
   PRIMARY KEY (chat_id, team_name)
 );
+
 CREATE TABLE IF NOT EXISTS sent_events (
   chat_id TEXT NOT NULL,
-  fixture_id INTEGER NOT NULL,
+  fixture_key TEXT NOT NULL,
   event_type TEXT NOT NULL,
-  PRIMARY KEY (chat_id, fixture_id, event_type)
+  PRIMARY KEY (chat_id, fixture_key, event_type)
 );
 `);
 
-const WORLD_CUP_TEAMS = [
-  "Mexico","South Korea","South Africa","Czechia",
-  "Canada","Switzerland","Qatar","Bosnia & Herzegovina",
-  "Brazil","Morocco","Scotland","Haiti",
-  "United States","Australia","Paraguay","Türkiye",
-  "Germany","Ecuador","Ivory Coast","Curaçao",
-  "Netherlands","Japan","Tunisia","Sweden",
-  "Belgium","Iran","Egypt","New Zealand",
-  "Spain","Uruguay","Saudi Arabia","Cape Verde",
-  "France","Senegal","Norway","Iraq",
-  "Argentina","Austria","Algeria","Jordan",
-  "Portugal","Colombia","Uzbekistan","Congo DR",
-  "England","Croatia","Panama","Ghana"
-];
+const WORLD_CUP_TEAMS = ["France", "Portugal", "Norway"];
 
-const TEAM_ALIASES = {
-  "united states": ["usa", "u.s.a", "us", "united states", "united states of america"],
-  "south korea": ["korea republic", "korea", "south korea"],
-  "north korea": ["dpr korea", "north korea"],
-  "iran": ["ir iran", "iran"],
-  "cabo verde": ["cape verde", "cabo verde"],
-  "cape verde": ["cape verde", "cabo verde"],
-  "ivory coast": ["ivory coast", "cote d ivoire", "côte d'ivoire", "cote d'ivoire"],
-  "cote d ivoire": ["ivory coast", "cote d ivoire", "côte d'ivoire"],
-  "turkiye": ["turkiye", "turkey", "türkiye"],
-  "curaçao": ["curacao", "curaçao"],
-  "curacao": ["curacao", "curaçao"],
-  "congo dr": ["dr congo", "democratic republic of congo", "congo dr", "congo"],
-  "czechia": ["czechia", "czech republic"],
-  "bosnia & herzegovina": ["bosnia & herzegovina", "bosnia and herzegovina"],
+// Times are stored in UTC and shown in Europe/Riga in messages.
+const FIXTURES = {
+  france: [
+    {
+      key: "france-senegal-2026-06-16",
+      home: "France",
+      away: "Senegal",
+      date: "2026-06-16T19:00:00Z",
+      sourceNote: "Confirmed group game"
+    },
+    {
+      key: "france-iraq-2026-06-22",
+      home: "France",
+      away: "Iraq",
+      date: "2026-06-22T21:00:00Z",
+      sourceNote: "Confirmed group game"
+    },
+    {
+      key: "norway-france-2026-06-26",
+      home: "Norway",
+      away: "France",
+      date: "2026-06-26T19:00:00Z",
+      sourceNote: "Confirmed group game"
+    }
+  ],
+  portugal: [
+    {
+      key: "portugal-congo-dr-2026-06-17",
+      home: "Portugal",
+      away: "Congo DR",
+      date: "2026-06-17T17:00:00Z",
+      sourceNote: "Confirmed group game"
+    },
+    {
+      key: "portugal-uzbekistan-2026-06-23",
+      home: "Portugal",
+      away: "Uzbekistan",
+      date: "2026-06-23T17:00:00Z",
+      sourceNote: "Confirmed group game"
+    },
+    {
+      key: "colombia-portugal-2026-06-27",
+      home: "Colombia",
+      away: "Portugal",
+      date: "2026-06-27T23:30:00Z",
+      sourceNote: "Confirmed group game"
+    }
+  ],
+  norway: [
+    {
+      key: "iraq-norway-2026-06-16",
+      home: "Iraq",
+      away: "Norway",
+      date: "2026-06-16T21:00:00Z",
+      sourceNote: "Confirmed group game"
+    },
+    {
+      key: "norway-senegal-2026-06-22",
+      home: "Norway",
+      away: "Senegal",
+      date: "2026-06-22T23:00:00Z",
+      sourceNote: "Confirmed group game"
+    },
+    {
+      key: "norway-france-2026-06-26",
+      home: "Norway",
+      away: "France",
+      date: "2026-06-26T19:00:00Z",
+      sourceNote: "Confirmed group game"
+    }
+  ]
 };
-
-const PAGE_SIZE = 8;
 
 const trackedTeams = (chatId) =>
   db
@@ -105,198 +133,131 @@ const removeTrackedTeam = (chatId, teamName) =>
     .prepare("DELETE FROM tracked_teams WHERE chat_id = ? AND team_name = ?")
     .run(String(chatId), teamName);
 
-const isSent = (chatId, fixtureId, eventType) =>
+const isSent = (chatId, fixtureKey, eventType) =>
   !!db
-    .prepare("SELECT 1 FROM sent_events WHERE chat_id=? AND fixture_id=? AND event_type=?")
-    .get(String(chatId), fixtureId, eventType);
+    .prepare(
+      "SELECT 1 FROM sent_events WHERE chat_id = ? AND fixture_key = ? AND event_type = ?"
+    )
+    .get(String(chatId), fixtureKey, eventType);
 
-const markSent = (chatId, fixtureId, eventType) =>
+const markSent = (chatId, fixtureKey, eventType) =>
   db
-    .prepare("INSERT OR IGNORE INTO sent_events (chat_id, fixture_id, event_type) VALUES (?, ?, ?)")
-    .run(String(chatId), fixtureId, eventType);
+    .prepare(
+      "INSERT OR IGNORE INTO sent_events (chat_id, fixture_key, event_type) VALUES (?, ?, ?)"
+    )
+    .run(String(chatId), fixtureKey, eventType);
 
-const fmtDate = (date) =>
-  new Date(date).toLocaleString("en-GB", { timeZone: TZ });
-
-function normalizeName(name) {
-  return String(name || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+function fmtDate(date) {
+  return new Date(date).toLocaleString("en-GB", {
+    timeZone: TZ,
+    weekday: "short",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
-function nameVariants(name) {
-  const n = normalizeName(name);
-  const out = new Set([n]);
-  const alias = TEAM_ALIASES[n];
-  if (alias) for (const a of alias) out.add(normalizeName(a));
-  return [...out];
+function getFixturesForTeam(teamName) {
+  return FIXTURES[teamName.toLowerCase()] || [];
 }
 
-function teamMatches(a, b) {
-  const na = nameVariants(a);
-  const nb = nameVariants(b);
-  return na.some((x) => nb.includes(x));
+function getNextFixtureForTeam(teamName) {
+  const now = Date.now();
+  return (
+    getFixturesForTeam(teamName)
+      .filter((f) => new Date(f.date).getTime() > now)
+      .sort((a, b) => new Date(a.date) - new Date(b.date))[0] || null
+  );
 }
 
-function matchLine(fx) {
-  return `${fx.teams.home.name} vs ${fx.teams.away.name}\n${fmtDate(fx.fixture.date)}`;
+function teamScheduleBlock(teamName) {
+  const fixtures = getFixturesForTeam(teamName)
+    .sort((a, b) => new Date(a.date) - new Date(b.date));
+
+  if (!fixtures.length) return null;
+
+  return [
+    `${teamName}:`,
+    ...fixtures.map((f) => `- ${f.home} vs ${f.away} — ${fmtDate(f.date)}`)
+  ].join("\n");
+}
+
+function teamNextBlock(teamName) {
+  const f = getNextFixtureForTeam(teamName);
+  if (!f) return null;
+  return `${teamName}:\n${f.home} vs ${f.away}\n${fmtDate(f.date)}`;
+}
+
+function settingsKeyboard(chatId) {
+  const current = trackedTeams(chatId).map((t) => t.team_name);
+  const rows = WORLD_CUP_TEAMS.map((name) => [
+    Markup.button.callback(
+      `${current.includes(name) ? "✅" : "➕"} ${name}`,
+      `toggle:${name}`
+    ),
+  ]);
+  rows.push([Markup.button.callback("📋 My tracked teams", "list_teams")]);
+  return Markup.inlineKeyboard(rows);
 }
 
 async function isAdmin(ctx) {
   if (ADMIN_ONLY_SETTINGS !== "true" || ctx.chat.type === "private") return true;
   try {
-    const m = await ctx.getChatMember(ctx.from.id);
-    return ["creator", "administrator"].includes(m.status);
+    const member = await ctx.getChatMember(ctx.from.id);
+    return ["creator", "administrator"].includes(member.status);
   } catch {
     return false;
   }
 }
 
-function settingsKeyboard(chatId, page = 0) {
-  const current = trackedTeams(chatId).map((t) => t.team_name);
-  const start = page * PAGE_SIZE;
-  const teams = WORLD_CUP_TEAMS.slice(start, start + PAGE_SIZE);
+bot.start(async (ctx) => {
+  await ctx.reply(
+    "World Cup bot is ready. Use /settings to track France, Portugal, and Norway."
+  );
+});
 
-  const rows = teams.map((name) => {
-    const enabled = current.includes(name);
-    return [
-      Markup.button.callback(
-        `${enabled ? "✅" : "➕"} ${name}`,
-        `toggle:${page}:${name}`
-      ),
-    ];
-  });
-
-  const nav = [];
-  if (page > 0) nav.push(Markup.button.callback("⬅️ Prev", `page:${page - 1}`));
-  if (start + PAGE_SIZE < WORLD_CUP_TEAMS.length) {
-    nav.push(Markup.button.callback("Next ➡️", `page:${page + 1}`));
-  }
-  if (nav.length) rows.push(nav);
-
-  rows.push([Markup.button.callback("📋 My tracked teams", "list_teams")]);
-
-  return Markup.inlineKeyboard(rows);
-}
-
-async function getUpcomingWorldCupFixtures() {
-  let all = [];
-  let page = 1;
-  let totalPages = 1;
-
-  do {
-    const r = await api.get("/fixtures", {
-      params: {
-        league: WORLD_CUP_LEAGUE_ID,
-        season: WORLD_CUP_SEASON,
-        status: "NS",
-        page,
-      },
-    });
-
-    all = all.concat(r.data?.response || []);
-    totalPages = r.data?.paging?.total || 1;
-    page += 1;
-  } while (page <= totalPages);
-
-  return all;
-}
-
-function findFixtureForTeam(fixtures, teamName) {
-  const targetVariants = nameVariants(teamName);
-  const now = Date.now();
-
-  return fixtures
-    .filter((fx) => new Date(fx.fixture.date).getTime() > now)
-    .filter((fx) => {
-      const home = fx.teams.home.name || "";
-      const away = fx.teams.away.name || "";
-      const homeVariants = nameVariants(home);
-      const awayVariants = nameVariants(away);
-      return (
-        targetVariants.some((v) => homeVariants.includes(v)) ||
-        targetVariants.some((v) => awayVariants.includes(v)) ||
-        homeVariants.some((v) => targetVariants.includes(v)) ||
-        awayVariants.some((v) => targetVariants.includes(v))
-      );
-    })
-    .sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date))[0] || null;
-}
-
-async function getNextFixtureForTeamName(teamName) {
-  const fixtures = await getUpcomingWorldCupFixtures();
-  let fx = findFixtureForTeam(fixtures, teamName);
-  if (fx) return fx;
-
-  const fallback = await api.get("/fixtures", {
-    params: {
-      league: WORLD_CUP_LEAGUE_ID,
-      season: WORLD_CUP_SEASON,
-      team: undefined,
-      page: 1,
-    },
-  }).catch(() => null);
-
-  const more = fallback?.data?.response || [];
-  fx = findFixtureForTeam(more, teamName);
-  return fx;
-}
-
-bot.start(async (ctx) =>
-  ctx.reply(
-    "2026 FIFA World Cup bot is ready. Add me to your group and use /settings to select teams to track."
-  )
-);
-
-bot.help(async (ctx) =>
-  ctx.reply(
+bot.help(async (ctx) => {
+  await ctx.reply(
     [
       "Commands:",
       "/settings - choose teams to track in this chat",
       "/list - show tracked teams",
-      "/matches - show next matches for tracked teams",
+      "/matches - show next match for tracked teams",
+      "/schedule - show all confirmed group matches for tracked teams",
       "/teststart - sample kickoff alert",
       "/testresult - sample final result alert",
       "/help - show help",
     ].join("\n")
-  )
-);
-
-bot.command("settings", async (ctx) => {
-  if (!(await isAdmin(ctx))) return ctx.reply("Only group admins can change settings.");
-  await ctx.reply(
-    "Select 2026 World Cup teams to track in this chat:",
-    settingsKeyboard(ctx.chat.id, 0)
   );
 });
 
-bot.action(/^page:(\d+)$/i, async (ctx) => {
-  if (!(await isAdmin(ctx))) return ctx.answerCbQuery("Admins only");
-  const page = Number(ctx.match[1] || 0);
-  await ctx.answerCbQuery();
-  await ctx.editMessageReplyMarkup(settingsKeyboard(ctx.chat.id, page).reply_markup);
+bot.command("settings", async (ctx) => {
+  if (!(await isAdmin(ctx))) {
+    return ctx.reply("Only group admins can change settings.");
+  }
+  await ctx.reply(
+    "Select teams to track in this chat:",
+    settingsKeyboard(ctx.chat.id)
+  );
 });
 
-bot.action(/^toggle:(\d+):(.+)$/i, async (ctx) => {
-  if (!(await isAdmin(ctx))) return ctx.answerCbQuery("Admins only");
+bot.action(/^toggle:(.+)$/i, async (ctx) => {
+  if (!(await isAdmin(ctx))) {
+    return ctx.answerCbQuery("Admins only");
+  }
 
-  const page = Number(ctx.match[1] || 0);
-  const teamName = ctx.match[2];
-
+  const teamName = ctx.match[1];
   if (!WORLD_CUP_TEAMS.includes(teamName)) {
     return ctx.answerCbQuery("Team not found");
   }
 
-  const existing = trackedTeams(ctx.chat.id).find(
+  const exists = trackedTeams(ctx.chat.id).find(
     (t) => t.team_name.toLowerCase() === teamName.toLowerCase()
   );
 
-  if (existing) {
+  if (exists) {
     removeTrackedTeam(ctx.chat.id, teamName);
     await ctx.answerCbQuery(`Removed ${teamName}`);
   } else {
@@ -304,7 +265,7 @@ bot.action(/^toggle:(\d+):(.+)$/i, async (ctx) => {
     await ctx.answerCbQuery(`Added ${teamName}`);
   }
 
-  await ctx.editMessageReplyMarkup(settingsKeyboard(ctx.chat.id, page).reply_markup);
+  await ctx.editMessageReplyMarkup(settingsKeyboard(ctx.chat.id).reply_markup);
 });
 
 bot.action("list_teams", async (ctx) => {
@@ -328,71 +289,72 @@ bot.command("list", async (ctx) => {
 
 bot.command("matches", async (ctx) => {
   const teams = trackedTeams(ctx.chat.id);
-  if (!teams.length) return ctx.reply("No teams selected yet. Use /settings.");
-
-  const fixtures = await getUpcomingWorldCupFixtures().catch(() => []);
-  const lines = [];
-
-  for (const team of teams) {
-    const fx = findFixtureForTeam(fixtures, team.team_name);
-    if (fx) lines.push(`\n${team.team_name}:\n${matchLine(fx)}`);
+  if (!teams.length) {
+    return ctx.reply("No teams selected yet. Use /settings.");
   }
+
+  const lines = teams.map((t) => teamNextBlock(t.team_name)).filter(Boolean);
 
   await ctx.reply(
     lines.length
-      ? lines.join("\n")
+      ? lines.map((x) => `\n${x}`).join("\n")
       : "No upcoming World Cup matches found for selected teams."
   );
 });
 
-bot.command("teststart", (ctx) =>
-  ctx.reply("⚽ Match starting now\nPortugal vs France\n2026 FIFA World Cup")
-);
+bot.command("schedule", async (ctx) => {
+  const teams = trackedTeams(ctx.chat.id);
+  if (!teams.length) {
+    return ctx.reply("No teams selected yet. Use /settings.");
+  }
 
-bot.command("testresult", (ctx) =>
-  ctx.reply("🏁 Full time\nPortugal 2 - 1 France\n2026 FIFA World Cup")
-);
+  const blocks = teams.map((t) => teamScheduleBlock(t.team_name)).filter(Boolean);
+
+  await ctx.reply(
+    blocks.length
+      ? blocks.join("\n\n")
+      : "No confirmed group schedule found for selected teams."
+  );
+});
+
+bot.command("teststart", async (ctx) => {
+  await ctx.reply("⚽ Match starting now\nFrance vs Senegal\n2026 FIFA World Cup");
+});
+
+bot.command("testresult", async (ctx) => {
+  await ctx.reply("🏁 Full time\nFrance vs Senegal\n2026 FIFA World Cup");
+});
 
 async function pollMatches() {
   const tracked = allTrackedTeams();
   if (!tracked.length) return;
 
-  const fixtures = await getUpcomingWorldCupFixtures().catch((e) => {
-    console.error("Fixture fetch failed:", e.message);
-    return [];
-  });
-
-  const nowMs = Date.now();
+  const now = Date.now();
 
   for (const row of tracked) {
-    const related = fixtures
-      .filter((fx) => {
-        const home = fx.teams.home.name || "";
-        const away = fx.teams.away.name || "";
-        return teamMatches(home, row.team_name) || teamMatches(away, row.team_name);
-      })
-      .sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date));
+    const fixtures = getFixturesForTeam(row.team_name).sort(
+      (a, b) => new Date(a.date) - new Date(b.date)
+    );
 
-    for (const fx of related) {
-      const fixtureId = fx.fixture.id;
-      const kickoff = new Date(fx.fixture.date).getTime();
-      const started = nowMs >= kickoff && nowMs < kickoff + 10 * 60 * 1000;
-      const finished = ["FT", "AET", "PEN"].includes(fx.fixture.status.short);
+    for (const fx of fixtures) {
+      const kickoff = new Date(fx.date).getTime();
+      const started = now >= kickoff && now < kickoff + 10 * 60 * 1000;
+      const finished = now >= kickoff + 2 * 60 * 60 * 1000;
 
-      if (started && !isSent(row.chat_id, fixtureId, "start")) {
+      if (started && !isSent(row.chat_id, fx.key, "start")) {
         await bot.telegram.sendMessage(
           row.chat_id,
-          `⚽ Match starting now\n${fx.teams.home.name} vs ${fx.teams.away.name}\n${fmtDate(fx.fixture.date)}\n2026 FIFA World Cup`
+          `⚽ Match starting now\n${fx.home} vs ${fx.away}\n${fmtDate(fx.date)}\n2026 FIFA World Cup`
         );
-        markSent(row.chat_id, fixtureId, "start");
+        markSent(row.chat_id, fx.key, "start");
       }
 
-      if (finished && !isSent(row.chat_id, fixtureId, "result")) {
+      if (finished && !isSent(row.chat_id, fx.key, "result")) {
         await bot.telegram.sendMessage(
           row.chat_id,
-          `🏁 Full time\n${fx.teams.home.name} ${fx.goals.home} - ${fx.goals.away} ${fx.teams.away.name}\n2026 FIFA World Cup`
+          `🏁 Full time\n${fx.home} vs ${fx.away}\n2026 FIFA World Cup`
         );
-        markSent(row.chat_id, fixtureId, "result");
+        markSent(row.chat_id, fx.key, "result");
       }
     }
   }
@@ -402,7 +364,7 @@ cron.schedule("* * * * *", async () => {
   try {
     await pollMatches();
   } catch (e) {
-    console.error("Polling error", e.message);
+    console.error("Polling error:", e.message);
   }
 });
 
